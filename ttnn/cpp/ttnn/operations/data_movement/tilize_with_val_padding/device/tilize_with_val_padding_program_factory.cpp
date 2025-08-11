@@ -831,250 +831,276 @@ operation::ProgramWithCallbacks tilize_with_val_padding_multi_core_sharded(
 
 operation::ProgramWithCallbacks tilize_with_val_padding_multi_core_height_sharded(
     const Tensor& a, Tensor& output, const ttnn::PadValue pad_value) {
+
     tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
 
     bool src_sharded = a.memory_config().is_sharded();
     bool out_sharded = output.memory_config().is_sharded();
 
-    tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
-    uint32_t input_single_tile_size = tt::tt_metal::detail::TileSize(input_cb_data_format);
+    tt::DataFormat input_cb_data_format  = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
     tt::DataFormat output_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
+    uint32_t input_single_tile_size  = tt::tt_metal::detail::TileSize(input_cb_data_format);
     uint32_t output_single_tile_size = tt::tt_metal::detail::TileSize(output_cb_data_format);
 
-    auto input_shard_spec = a.shard_spec().value();
+    auto input_shard_spec  = a.shard_spec().value();
     auto output_shard_spec = output.shard_spec().value();
+    auto all_cores         = output_shard_spec.grid;
 
-    auto all_cores = output_shard_spec.grid;
-
+    // Number of (N*C*B) batches mapped into each core's shard:
     uint32_t num_batches = output.physical_volume() / (output.padded_shape()[-2] * output.padded_shape()[-1]);
 
-    uint32_t num_input_rows = input_shard_spec.shape[0];
-    uint32_t input_shard_width_bytes = input_shard_spec.shape[1] * a.element_size();
-    uint32_t ntiles_per_core = output_shard_spec.shape[0] * output_shard_spec.shape[1] / TILE_HW;
-    uint32_t ntiles_per_batch = ntiles_per_core / num_batches;
-    uint32_t ntiles_per_block = output_shard_spec.shape[1] / TILE_WIDTH;
-    uint32_t nblocks_per_core = output_shard_spec.shape[0] / TILE_HEIGHT;
-    uint32_t num_padded_rows = output.padded_shape()[-2] - a.padded_shape()[-2];
+    // Per-core shapes
+    const uint32_t in_rows_per_core  = input_shard_spec.shape[0];
+    const uint32_t in_cols_per_core  = input_shard_spec.shape[1];
+    const uint32_t out_rows_per_core = output_shard_spec.shape[0];
+    const uint32_t out_cols_per_core = output_shard_spec.shape[1];
 
-    // Input CB - reads from height sharded input using ShardedAddrGen
+    // Per-batch (on this core)
+    const uint32_t in_rows_per_batch  = in_rows_per_core  / num_batches;
+    const uint32_t out_rows_per_batch = out_rows_per_core / num_batches;
+
+    // Row sizes in bytes
+    const uint32_t in_row_bytes  = in_cols_per_core  * a.element_size();
+    const uint32_t out_row_bytes = out_cols_per_core * output.element_size();
+
+    // Padding amounts
+    TT_ASSERT(out_row_bytes >= in_row_bytes, "Output row bytes must be >= input row bytes");
+    const uint32_t pad_cols_bytes      = out_row_bytes - in_row_bytes;
+    TT_ASSERT(out_rows_per_batch >= in_rows_per_batch, "Output rows per batch must be >= input rows per batch");
+    const uint32_t pad_rows_per_batch  = out_rows_per_batch - in_rows_per_batch;
+
+    // Tiles per core/batch for compute
+    const uint32_t ntiles_per_block = out_cols_per_core / TILE_WIDTH;
+    const uint32_t nblocks_per_core = out_rows_per_core / TILE_HEIGHT;
+    const uint32_t ntiles_per_core  = (out_rows_per_core * out_cols_per_core) / TILE_HW;
+    const uint32_t ntiles_per_batch = ntiles_per_core / num_batches;
+
+    // ---- CBs ----
+
+    // Input CB: page = input row bytes, bound to input buffer (sharded)
     auto [src0_cb_index, cb_src0] = create_cb(
-        tt::CBIndex::c_1,
-        program,
-        all_cores,
-        input_shard_width_bytes,
-        num_input_rows,
+        tt::CBIndex::c_1, program, all_cores,
+        /*page_size_bytes*/ in_row_bytes,
+        /*pages*/ in_rows_per_core,
         input_cb_data_format,
         src_sharded ? a.buffer() : nullptr);
 
-    // Intermediate CB for tilized data
+    // Reader output / compute input CB: tile-sized pages (what tilize.cpp expects)
     auto [src1_cb_index, cb_src1] = create_cb(
-        tt::CBIndex::c_0, program, all_cores, input_single_tile_size, ntiles_per_batch * 2, input_cb_data_format);
+        tt::CBIndex::c_0, program, all_cores,
+        /*page_size_bytes*/ input_single_tile_size,
+        /*capacity pages*/  ntiles_per_batch * 2,  // double-buffering
+        input_cb_data_format);
 
-    // Padding CB
-    auto [src2_cb_index, cb_src2] =
-        create_cb(tt::CBIndex::c_2, program, all_cores, input_shard_width_bytes, 1, input_cb_data_format);
+    // Pad CB: one page = full output row
+    auto [src2_cb_index, cb_src2] = create_cb(
+        tt::CBIndex::c_2, program, all_cores,
+        /*page_size_bytes*/ out_row_bytes,
+        /*pages*/ 1,
+        input_cb_data_format);
 
-    // Output CB - writes to height sharded output using ShardedAddrGen  
+    // Output CB: tile-sized pages, bound to output buffer (sharded)
     auto [output_cb_index, cb_output] = create_cb(
-        tt::CBIndex::c_16,
-        program,
-        all_cores,
-        output_single_tile_size,
-        ntiles_per_core,
+        tt::CBIndex::c_16, program, all_cores,
+        /*page_size_bytes*/ output_single_tile_size,
+        /*pages*/ ntiles_per_core,
         output_cb_data_format,
         out_sharded ? output.buffer() : nullptr);
 
     Buffer* dst_buffer = output.buffer();
     TT_ASSERT(dst_buffer != nullptr, "Output buffer should be allocated on device!");
 
-    // Reader kernel - uses ShardedAddrGen for height sharded input
-    KernelHandle unary_reader_kernel_id;
+    // ---- Kernels ----
+
+    // Reader (height-sharded with pad)
     std::vector<uint32_t> reader_ct_args = {
-        (std::uint32_t)src0_cb_index,
-        (std::uint32_t)src1_cb_index,
-        (std::uint32_t)src2_cb_index,
+        (uint32_t)src0_cb_index,
+        (uint32_t)src1_cb_index,
+        (uint32_t)src2_cb_index,
     };
 
-    unary_reader_kernel_id = tt::tt_metal::CreateKernel(
+    auto reader_kernel = tt::tt_metal::CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/"
         "reader_unary_pad_height_sharded.cpp",
         all_cores,
         tt::tt_metal::ReaderDataMovementConfig(reader_ct_args));
 
-    // Writer kernel - uses ShardedAddrGen for height sharded output
-    KernelHandle unary_writer_kernel_id;
-    std::vector<uint32_t> writer_ct_args = {
-        output_cb_index,
-    };
-    unary_writer_kernel_id = CreateKernel(
+    // Writer (sharded)
+    std::vector<uint32_t> writer_ct_args = { output_cb_index };
+    auto writer_kernel = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/data_movement/sharded/device/kernels/dataflow/writer_unary_sharded.cpp",
         all_cores,
         WriterDataMovementConfig(writer_ct_args));
 
-    // Compute kernel
+    // Compute (tilize)
     std::vector<uint32_t> compute_args = {
         (uint32_t)nblocks_per_core,  // per_core_block_cnt
         (uint32_t)ntiles_per_block,  // per_block_ntiles
     };
-
     CreateKernel(
         program,
         "ttnn/cpp/ttnn/deprecated/tt_dnn/kernels/compute/tilize.cpp",
         all_cores,
         ComputeConfig{.compile_args = compute_args});
 
-    uint32_t packed_pad_value = get_packed_value(a, pad_value);
+    // ---- Runtime args ----
+    const uint32_t packed_pad_value = get_packed_value(a, pad_value);
 
     const std::array reader_rt_args = {
-        num_input_rows,
-        input_shard_width_bytes,
-        (num_input_rows / num_batches) * input_shard_width_bytes,
+        in_rows_per_batch,
+        in_row_bytes,
+        out_row_bytes,
         ntiles_per_batch,
-        num_padded_rows,
+        pad_rows_per_batch,
         num_batches,
-        packed_pad_value};
-    tt::tt_metal::SetRuntimeArgs(program, unary_reader_kernel_id, all_cores, reader_rt_args);
+        packed_pad_value,
+        pad_cols_bytes
+    };
+    tt::tt_metal::SetRuntimeArgs(program, reader_kernel, all_cores, reader_rt_args);
 
-    const std::array writer_rt_args = {ntiles_per_core};
-    tt::tt_metal::SetRuntimeArgs(program, unary_writer_kernel_id, all_cores, writer_rt_args);
+    const std::array writer_rt_args = { ntiles_per_core };
+    tt::tt_metal::SetRuntimeArgs(program, writer_kernel, all_cores, writer_rt_args);
 
-    auto override_runtime_arguments_callback = [reader_kernel_id = unary_reader_kernel_id,
-                                                writer_kernel_id = unary_writer_kernel_id,
-                                                cb_src0 = cb_src0,
-                                                cb_output = cb_output](
-                                                   const void* operation,
-                                                   Program& program,
-                                                   const std::vector<Tensor>& input_tensors,
-                                                   const std::vector<std::optional<const Tensor>>&,
-                                                   const std::vector<Tensor>& output_tensors) {
-        auto src_buffer = input_tensors.at(0).buffer();
-        auto dst_buffer = output_tensors.at(0).buffer();
-
-        UpdateDynamicCircularBufferAddress(program, cb_src0, *src_buffer);
-        UpdateDynamicCircularBufferAddress(program, cb_output, *dst_buffer);
+    auto override_cb = [reader_kernel,
+                        writer_kernel,
+                        cb_src0 = cb_src0,
+                        cb_output = cb_output](
+                           const void*, Program& program,
+                           const std::vector<Tensor>& inputs,
+                           const std::vector<std::optional<const Tensor>>&,
+                           const std::vector<Tensor>& outputs) {
+        UpdateDynamicCircularBufferAddress(program, cb_src0,   *inputs.at(0).buffer());
+        UpdateDynamicCircularBufferAddress(program, cb_output, *outputs.at(0).buffer());
     };
 
-    return {.program = std::move(program), .override_runtime_arguments_callback = override_runtime_arguments_callback};
+    return {.program = std::move(program), .override_runtime_arguments_callback = override_cb};
 }
 
 operation::ProgramWithCallbacks tilize_with_val_padding_single_core_height_sharded(
     const Tensor& a, Tensor& output, const ttnn::PadValue pad_value) {
-    tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
 
+    tt::tt_metal::Program program = tt::tt_metal::CreateProgram();
     CoreRange core({0, 0}, {0, 0});
 
-    tt::tt_metal::Buffer* src0_buffer = a.buffer();
-    tt::tt_metal::Buffer* dst_buffer = output.buffer();
+    TT_ASSERT(a.memory_config().is_sharded() && output.memory_config().is_sharded(),
+              "Single-core height-sharded path expects sharded tensors");
 
-    tt::DataFormat input_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
-    uint32_t input_single_tile_size = tt::tt_metal::detail::TileSize(input_cb_data_format);
-
+    tt::DataFormat input_cb_data_format  = tt::tt_metal::datatype_to_dataformat_converter(a.dtype());
     tt::DataFormat output_cb_data_format = tt::tt_metal::datatype_to_dataformat_converter(output.dtype());
+    uint32_t input_single_tile_size  = tt::tt_metal::detail::TileSize(input_cb_data_format);
     uint32_t output_single_tile_size = tt::tt_metal::detail::TileSize(output_cb_data_format);
 
-    int32_t num_tiles = output.physical_volume() / TILE_HW;
-
-    auto input_shard_spec = a.shard_spec().value();
+    auto input_shard_spec  = a.shard_spec().value();
     auto output_shard_spec = output.shard_spec().value();
 
-    uint32_t num_input_rows = input_shard_spec.shape[0];
-    uint32_t input_shard_width_bytes = input_shard_spec.shape[1] * a.element_size();
-    uint32_t ntiles_per_core = output_shard_spec.shape[0] * output_shard_spec.shape[1] / TILE_HW;
-    uint32_t ntiles_per_block = output_shard_spec.shape[1] / TILE_WIDTH;
-    uint32_t nblocks_per_core = output_shard_spec.shape[0] / TILE_HEIGHT;
+    // Same math as multi-core, but for one core
+    uint32_t num_batches = output.physical_volume() / (output.padded_shape()[-2] * output.padded_shape()[-1]);
 
-    uint32_t src0_cb_index = 0;
-    uint32_t num_input_tiles = ntiles_per_block;
-    tt::tt_metal::CircularBufferConfig src0_cb_config =
-        tt::tt_metal::CircularBufferConfig(
-            num_input_tiles * input_single_tile_size, {{src0_cb_index, input_cb_data_format}})
-            .set_page_size(src0_cb_index, input_single_tile_size);
-    tt::tt_metal::CreateCircularBuffer(program, core, src0_cb_config);
+    const uint32_t in_rows_per_core  = input_shard_spec.shape[0];
+    const uint32_t in_cols_per_core  = input_shard_spec.shape[1];
+    const uint32_t out_rows_per_core = output_shard_spec.shape[0];
+    const uint32_t out_cols_per_core = output_shard_spec.shape[1];
 
-    uint32_t output_cb_index = tt::CBIndex::c_16;
-    uint32_t num_output_tiles = ntiles_per_block;
-    tt::tt_metal::CircularBufferConfig cb_output_config =
-        tt::tt_metal::CircularBufferConfig(
-            num_output_tiles * output_single_tile_size, {{output_cb_index, output_cb_data_format}})
-            .set_page_size(output_cb_index, output_single_tile_size);
-    tt::tt_metal::CreateCircularBuffer(program, core, cb_output_config);
+    const uint32_t in_rows_per_batch  = in_rows_per_core  / num_batches;
+    const uint32_t out_rows_per_batch = out_rows_per_core / num_batches;
 
-    uint32_t packed_pad_value = get_packed_value(a, pad_value);
+    const uint32_t in_row_bytes  = in_cols_per_core  * a.element_size();
+    const uint32_t out_row_bytes = out_cols_per_core * output.element_size();
 
-    // Reader kernel compile-time args
-    std::vector<uint32_t> reader_compile_time_args = {
-        (uint32_t)(src0_buffer->buffer_type() == tt::tt_metal::BufferType::DRAM ? 1 : 0),
+    const uint32_t pad_cols_bytes     = out_row_bytes - in_row_bytes;
+    const uint32_t pad_rows_per_batch = out_rows_per_batch - in_rows_per_batch;
+
+    const uint32_t ntiles_per_block = out_cols_per_core / TILE_WIDTH;
+    const uint32_t nblocks_per_core = out_rows_per_core / TILE_HEIGHT;
+    const uint32_t ntiles_per_core  = (out_rows_per_core * out_cols_per_core) / TILE_HW;
+    const uint32_t ntiles_per_batch = ntiles_per_core / num_batches;
+
+    // ---- CBs (single core) ----
+    auto [src0_cb_index, cb_src0] = create_cb(
+        tt::CBIndex::c_1, program, core,
+        /*page size*/ in_row_bytes,
+        /*pages*/ in_rows_per_core,
+        input_cb_data_format,
+        a.buffer());
+
+    auto [src1_cb_index, cb_src1] = create_cb(
+        tt::CBIndex::c_0, program, core,
+        /*page size*/ input_single_tile_size,
+        /*capacity*/  ntiles_per_batch * 2,
+        input_cb_data_format);
+
+    auto [src2_cb_index, cb_src2] = create_cb(
+        tt::CBIndex::c_2, program, core,
+        /*page size*/ out_row_bytes,
+        /*pages*/ 1,
+        input_cb_data_format);
+
+    auto [output_cb_index, cb_output] = create_cb(
+        tt::CBIndex::c_16, program, core,
+        /*page size*/ output_single_tile_size,
+        /*pages*/ ntiles_per_core,
+        output_cb_data_format,
+        output.buffer());
+
+    // ---- Kernels ----
+    std::vector<uint32_t> reader_ct_args = {
         (uint32_t)src0_cb_index,
-        (uint32_t)num_tiles,
-        (uint32_t)(input_single_tile_size),
-        (uint32_t)0, // start_page_id
+        (uint32_t)src1_cb_index,
+        (uint32_t)src2_cb_index,
     };
-    shard_builder::extend_sharding_compile_time_args(a, reader_compile_time_args);
-
-    // Reader kernel - uses ShardedAddrGen for height sharded input
-    std::map<std::string, std::string> reader_compute_defines = {{"SHARDED", "1"}};
-    tt::tt_metal::KernelHandle unary_reader_kernel_id = tt::tt_metal::CreateKernel(
+    auto reader_kernel = tt::tt_metal::CreateKernel(
         program,
-        "ttnn/cpp/ttnn/operations/data_movement/untilize/device/kernels/dataflow/"
-        "reader_unary_start_id.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/tilize_with_val_padding/device/kernels/dataflow/"
+        "reader_unary_pad_height_sharded.cpp",
         core,
-        tt::tt_metal::ReaderDataMovementConfig(reader_compile_time_args, reader_compute_defines));
+        tt::tt_metal::ReaderDataMovementConfig(reader_ct_args));
 
-    // Writer kernel compile-time args  
-    std::vector<uint32_t> writer_compile_time_args = {output_cb_index};
-    shard_builder::extend_sharding_compile_time_args(output, writer_compile_time_args);
-
-    // Writer kernel - uses ShardedAddrGen for height sharded output
-    std::map<std::string, std::string> writer_compute_defines = {{"SHARDED", "1"}};
-    tt::tt_metal::KernelHandle unary_writer_kernel_id = tt::tt_metal::CreateKernel(
+    std::vector<uint32_t> writer_ct_args = { output_cb_index };
+    auto writer_kernel = tt::tt_metal::CreateKernel(
         program,
-        "ttnn/cpp/ttnn/operations/eltwise/unary/device/kernels/dataflow/writer_unary_interleaved_start_id.cpp",
+        "ttnn/cpp/ttnn/operations/data_movement/sharded/device/kernels/dataflow/writer_unary_sharded.cpp",
         core,
-        tt::tt_metal::WriterDataMovementConfig(writer_compile_time_args, writer_compute_defines));
+        tt::tt_metal::WriterDataMovementConfig(writer_ct_args));
 
     std::vector<uint32_t> compute_kernel_args = {
-        uint32_t(num_tiles / ntiles_per_block), uint32_t(ntiles_per_block)};
-
+        (uint32_t)nblocks_per_core,
+        (uint32_t)ntiles_per_block
+    };
     tt::tt_metal::CreateKernel(
         program,
         "ttnn/cpp/ttnn/deprecated/tt_dnn/kernels/compute/tilize.cpp",
         core,
         tt::tt_metal::ComputeConfig{.compile_args = compute_kernel_args});
 
-    // Reader runtime args
-    std::vector<uint32_t> reader_run_time_args = {src0_buffer->address()};
-    shard_builder::extend_sharding_run_time_args(a, reader_run_time_args);
-    tt::tt_metal::SetRuntimeArgs(program, unary_reader_kernel_id, core, reader_run_time_args);
+    const uint32_t packed_pad_value = get_packed_value(a, pad_value);
 
-    // Writer runtime args
-    std::vector<uint32_t> writer_run_time_args = {dst_buffer->address(), (uint32_t)num_tiles, 0};
-    shard_builder::extend_sharding_run_time_args(output, writer_run_time_args);
-    tt::tt_metal::SetRuntimeArgs(program, unary_writer_kernel_id, core, writer_run_time_args);
-
-    auto override_runtime_args_callback = [reader_kernel_id = unary_reader_kernel_id,
-                                           writer_kernel_id = unary_writer_kernel_id](
-                                              const void* operation,
-                                              Program& program,
-                                              const std::vector<Tensor>& input_tensors,
-                                              const std::vector<std::optional<const Tensor>>& optional_tensors,
-                                              const std::vector<Tensor>& output_tensors) {
-        auto src_buffer = input_tensors.at(0).buffer();
-        auto dst_buffer = output_tensors.at(0).buffer();
-
-        CoreCoord core = {0, 0};
-
-        {
-            auto& runtime_args = GetRuntimeArgs(program, reader_kernel_id, core);
-            runtime_args[0] = src_buffer->address();
-        }
-
-        {
-            auto& runtime_args = GetRuntimeArgs(program, writer_kernel_id, core);
-            runtime_args[0] = dst_buffer->address();
-        }
+    const std::array reader_rt_args = {
+        in_rows_per_batch,
+        in_row_bytes,
+        out_row_bytes,
+        ntiles_per_batch,
+        pad_rows_per_batch,
+        num_batches,
+        packed_pad_value,
+        pad_cols_bytes
     };
+    tt::tt_metal::SetRuntimeArgs(program, reader_kernel, core, reader_rt_args);
+
+    const std::array writer_rt_args = { ntiles_per_core };
+    tt::tt_metal::SetRuntimeArgs(program, writer_kernel, core, writer_rt_args);
+
+    auto override_runtime_args_callback =
+        [reader_kernel, writer_kernel, cb_src0 = cb_src0, cb_output = cb_output](
+            const void*, Program& program,
+            const std::vector<Tensor>& inputs,
+            const std::vector<std::optional<const Tensor>>&,
+            const std::vector<Tensor>& outputs) {
+
+            UpdateDynamicCircularBufferAddress(program, cb_src0,   *inputs.at(0).buffer());
+            UpdateDynamicCircularBufferAddress(program, cb_output, *outputs.at(0).buffer());
+        };
 
     return {std::move(program), override_runtime_args_callback};
 }
