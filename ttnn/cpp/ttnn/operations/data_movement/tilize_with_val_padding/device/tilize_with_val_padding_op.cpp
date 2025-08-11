@@ -79,6 +79,19 @@ void TilizeWithValPadding::validate(const std::vector<Tensor>& input_tensors) co
     }
     // Interleaved to interleaved is always supported
     
+    // HEIGHT_SHARDED specific constraint: per-core width cannot change
+    if ((input_is_sharded && input_layout == TensorMemoryLayout::HEIGHT_SHARDED) ||
+        (output_is_sharded && output_layout == TensorMemoryLayout::HEIGHT_SHARDED)) {
+        
+        auto input_width = input_tensor_a.padded_shape()[-1];
+        auto output_width = this->output_padded_shape[-1];
+        
+        TT_FATAL(output_width == input_width,
+            "HEIGHT_SHARDED tensors cannot change width (input width = {}, output width = {}). "
+            "Per-core width must match device physical width. Use INTERLEAVED or BLOCK_SHARDED for width padding.",
+            input_width, output_width);
+    }
+    
     if (input_is_sharded) {
         for (uint32_t i = 0; i < input_tensor_a.padded_shape().rank(); i++) {
             if (i != input_shape.rank() - 2) {

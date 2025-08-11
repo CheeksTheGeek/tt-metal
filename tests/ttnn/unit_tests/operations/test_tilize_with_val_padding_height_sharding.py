@@ -15,10 +15,10 @@ from tests.ttnn.utils_for_testing import assert_with_pcc
 @pytest.mark.parametrize(
     "input_shape, output_shape",
     [
-        # Use tile-aligned heights for multi-core height sharding
-        ([1, 1, 64, 32], [1, 1, 128, 64]),
-        ([2, 1, 64, 128], [2, 1, 128, 256]),
-        ([1, 2, 128, 256], [1, 2, 256, 512]),
+        # HEIGHT_SHARDED: only pad height, keep width constant (width must match physical device width)
+        ([1, 1, 64, 128], [1, 1, 128, 128]),
+        ([2, 1, 64, 128], [2, 1, 128, 128]),
+        ([1, 2, 128, 256], [1, 2, 256, 256]),
     ],
 )
 @pytest.mark.parametrize("pad_value", [0.0, 1.5, -3.2])
@@ -200,8 +200,7 @@ def test_tilize_with_val_padding_block_sharded(
 @pytest.mark.parametrize(
     "input_layout, output_layout",
     [
-        (ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.TensorMemoryLayout.INTERLEAVED),
-        (ttnn.TensorMemoryLayout.INTERLEAVED, ttnn.TensorMemoryLayout.HEIGHT_SHARDED),
+        # Only test supported combinations - HEIGHT_SHARDED with constant width
         (ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.TensorMemoryLayout.HEIGHT_SHARDED),
     ],
 )
@@ -210,8 +209,9 @@ def test_tilize_with_val_padding_memory_layout_combinations(
 ):
     """Test TilizeWithValPadding with different input/output memory layout combinations."""
     
+    # Use constant width for HEIGHT_SHARDED to avoid width constraint violation
     input_shape = [1, 1, 64, 128]
-    output_shape = [1, 1, 128, 256]
+    output_shape = [1, 1, 128, 128]  # Only pad height, keep width constant
     pad_value = 1.0
     
     num_cores = 2
@@ -224,7 +224,7 @@ def test_tilize_with_val_padding_memory_layout_combinations(
     shard_shape = (shard_height, width)
     
     output_total_height = 128
-    output_width = 256
+    output_width = 128  # Keep width constant
     output_shard_height = output_total_height // num_cores
     output_shard_shape = (output_shard_height, output_width)
     
@@ -263,10 +263,55 @@ def test_tilize_with_val_padding_memory_layout_combinations(
     
     # Create expected output
     expected_output = torch.full(output_shape, pad_value, dtype=torch.bfloat16)
-    expected_output[:, :, :64, :128] = input_torch
+    expected_output[:, :, :64, :] = input_torch  # Width is constant, only height is padded
     
     # Assert outputs match within tolerance
     assert_with_pcc(expected_output, output_torch, 0.9999)
+
+
+def test_tilize_with_val_padding_mixed_layout_failures(device):
+    """Test that mixed layout combinations fail with appropriate error messages."""
+    
+    input_shape = [1, 1, 32, 32]
+    input_torch = torch.randn(input_shape, dtype=torch.bfloat16)
+    input_ttnn = ttnn.from_torch(input_torch, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+    
+    core_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 1))})
+    shard_shape = (16, 32)
+    
+    # Test 1: HEIGHT_SHARDED input -> INTERLEAVED output (mixed layouts not supported)
+    input_shard_spec = ttnn.ShardSpec(core_grid, shard_shape, ttnn.ShardOrientation.ROW_MAJOR)
+    input_memory_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, input_shard_spec
+    )
+    output_memory_config = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.INTERLEAVED, ttnn.BufferType.L1)
+    
+    input_ttnn_sharded = ttnn.to_device(input_ttnn, device, memory_config=input_memory_config)
+    
+    with pytest.raises(RuntimeError, match="Mixed interleaved/sharded memory layout combinations are not yet supported"):
+        ttnn.tilize_with_val_padding(
+            input_ttnn_sharded,
+            output_tensor_shape=[1, 1, 64, 64],
+            pad_value=0.0,
+            memory_config=output_memory_config,
+        )
+
+    # Test 2: INTERLEAVED input -> HEIGHT_SHARDED output (mixed layouts not supported)
+    input_memory_config_interleaved = ttnn.MemoryConfig(ttnn.TensorMemoryLayout.INTERLEAVED, ttnn.BufferType.DRAM)
+    output_shard_spec = ttnn.ShardSpec(core_grid, (32, 64), ttnn.ShardOrientation.ROW_MAJOR)
+    output_memory_config_sharded = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, output_shard_spec
+    )
+    
+    input_ttnn_interleaved = ttnn.to_device(input_ttnn, device, memory_config=input_memory_config_interleaved)
+    
+    with pytest.raises(RuntimeError, match="Mixed interleaved/sharded memory layout combinations are not yet supported"):
+        ttnn.tilize_with_val_padding(
+            input_ttnn_interleaved,
+            output_tensor_shape=[1, 1, 64, 128],  # Increasing width would also fail HEIGHT_SHARDED constraint
+            pad_value=0.0,
+            memory_config=output_memory_config_sharded,
+        )
 
 
 def test_tilize_with_val_padding_height_sharding_validation_errors(device):
@@ -276,26 +321,38 @@ def test_tilize_with_val_padding_height_sharding_validation_errors(device):
     input_torch = torch.randn(input_shape, dtype=torch.bfloat16)
     input_ttnn = ttnn.from_torch(input_torch, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
     
-    # Test mismatched input/output memory layouts
     core_grid = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(0, 1))})
     shard_shape = (16, 32)
     
+    # Test 1: HEIGHT_SHARDED width change should fail with specific error message
     input_shard_spec = ttnn.ShardSpec(core_grid, shard_shape, ttnn.ShardOrientation.ROW_MAJOR)
     input_memory_config = ttnn.MemoryConfig(
         ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, input_shard_spec
     )
-    
-    # Different output memory layout should fail
+    output_shard_spec = ttnn.ShardSpec(core_grid, (32, 64), ttnn.ShardOrientation.ROW_MAJOR)
     output_memory_config = ttnn.MemoryConfig(
-        ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, input_shard_spec
+        ttnn.TensorMemoryLayout.HEIGHT_SHARDED, ttnn.BufferType.L1, output_shard_spec
     )
     
     input_ttnn = ttnn.to_device(input_ttnn, device, memory_config=input_memory_config)
     
-    with pytest.raises(RuntimeError, match="Output tensor must have the same memory layout"):
+    with pytest.raises(RuntimeError, match="HEIGHT_SHARDED tensors cannot change width"):
         ttnn.tilize_with_val_padding(
             input_ttnn,
-            output_tensor_shape=[1, 1, 64, 64],
+            output_tensor_shape=[1, 1, 64, 64],  # Width changes from 32 to 64
             pad_value=0.0,
             memory_config=output_memory_config,
+        )
+    
+    # Test 2: Different sharding types should fail
+    different_shard_output_config = ttnn.MemoryConfig(
+        ttnn.TensorMemoryLayout.WIDTH_SHARDED, ttnn.BufferType.L1, input_shard_spec
+    )
+    
+    with pytest.raises(RuntimeError, match="input and output must have the same memory layout"):
+        ttnn.tilize_with_val_padding(
+            input_ttnn,
+            output_tensor_shape=[1, 1, 64, 32],  # Keep width same but different layout
+            pad_value=0.0,
+            memory_config=different_shard_output_config,
         )
