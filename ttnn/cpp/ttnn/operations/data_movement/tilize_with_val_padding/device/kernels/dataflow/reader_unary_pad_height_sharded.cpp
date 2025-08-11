@@ -19,14 +19,12 @@ void kernel_main() {
     constexpr uint32_t cb_id_out = get_compile_time_arg_val(1); // tile-paged CB (page = 2048 for bf16)
     constexpr uint32_t cb_id_pad = get_compile_time_arg_val(2); // page = out_row_bytes
 
-    // Reserve enough "pages" on the bound input CB to cover all rows across batches
-    cb_reserve_back(cb_id_in0, in_rows_per_batch * num_batches);
     // Pad CB: just one page that we fill with pad value
     cb_reserve_back(cb_id_pad, 1);
 
     // Prepare the pad page (full out_row_bytes of pad value)
     uint32_t pad_addr = get_write_ptr(cb_id_pad);
-    volatile tt_l1_ptr std::uint32_t* pad = (volatile tt_l1_ptr std::uint32_t*)(pad_addr);
+    volatile tt_l1_ptr uint32_t* pad = (volatile tt_l1_ptr uint32_t*)(pad_addr);
     for (uint32_t i = 0; i < (out_row_bytes >> 2); ++i) {
         pad[i] = packed_pad_value;
     }
@@ -49,7 +47,7 @@ void kernel_main() {
             write_addr    += in_row_bytes;
 
             // pad columns to reach out_row_bytes for this row
-            if (pad_cols_bytes) {
+            if (pad_cols_bytes > 0) {
                 noc_async_read(pad_noc_addr, write_addr, pad_cols_bytes);
                 write_addr += pad_cols_bytes;
             }

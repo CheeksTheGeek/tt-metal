@@ -928,6 +928,7 @@ operation::ProgramWithCallbacks tilize_with_val_padding_multi_core_height_sharde
 
     // Writer (sharded)
     std::vector<uint32_t> writer_ct_args = { output_cb_index };
+    shard_builder::extend_sharding_compile_time_args(output, writer_ct_args);
     auto writer_kernel = CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/data_movement/sharded/device/kernels/dataflow/writer_unary_sharded.cpp",
@@ -960,7 +961,8 @@ operation::ProgramWithCallbacks tilize_with_val_padding_multi_core_height_sharde
     };
     tt::tt_metal::SetRuntimeArgs(program, reader_kernel, all_cores, reader_rt_args);
 
-    const std::array writer_rt_args = { ntiles_per_core };
+    std::vector<uint32_t> writer_rt_args = { ntiles_per_core };
+    shard_builder::extend_sharding_run_time_args(output, writer_rt_args);
     tt::tt_metal::SetRuntimeArgs(program, writer_kernel, all_cores, writer_rt_args);
 
     auto override_cb = [reader_kernel,
@@ -1058,6 +1060,7 @@ operation::ProgramWithCallbacks tilize_with_val_padding_single_core_height_shard
         tt::tt_metal::ReaderDataMovementConfig(reader_ct_args));
 
     std::vector<uint32_t> writer_ct_args = { output_cb_index };
+    shard_builder::extend_sharding_compile_time_args(output, writer_ct_args);
     auto writer_kernel = tt::tt_metal::CreateKernel(
         program,
         "ttnn/cpp/ttnn/operations/data_movement/sharded/device/kernels/dataflow/writer_unary_sharded.cpp",
@@ -1088,7 +1091,8 @@ operation::ProgramWithCallbacks tilize_with_val_padding_single_core_height_shard
     };
     tt::tt_metal::SetRuntimeArgs(program, reader_kernel, core, reader_rt_args);
 
-    const std::array writer_rt_args = { ntiles_per_core };
+    std::vector<uint32_t> writer_rt_args = { ntiles_per_core };
+    shard_builder::extend_sharding_run_time_args(output, writer_rt_args);
     tt::tt_metal::SetRuntimeArgs(program, writer_kernel, core, writer_rt_args);
 
     auto override_runtime_args_callback =
@@ -1104,5 +1108,7 @@ operation::ProgramWithCallbacks tilize_with_val_padding_single_core_height_shard
 
     return {std::move(program), override_runtime_args_callback};
 }
+
+
 
 }  // namespace ttnn::operations::data_movement::detail
