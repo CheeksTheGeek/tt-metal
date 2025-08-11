@@ -15,7 +15,8 @@ from tests.ttnn.utils_for_testing import assert_with_pcc
 @pytest.mark.parametrize(
     "input_shape, output_shape",
     [
-        ([1, 1, 32, 32], [1, 1, 64, 64]),
+        # Use tile-aligned heights for multi-core height sharding
+        ([1, 1, 64, 32], [1, 1, 128, 64]),
         ([2, 1, 64, 128], [2, 1, 128, 256]),
         ([1, 2, 128, 256], [1, 2, 256, 512]),
     ],
@@ -42,9 +43,13 @@ def test_tilize_with_val_padding_height_sharded(
     shard_height = total_height // num_cores
     shard_shape = (shard_height, width)
     
-    # Skip test if height can't be evenly divided across cores
-    if total_height % num_cores != 0:
-        pytest.skip(f"Height {total_height} cannot be evenly divided across {num_cores} cores")
+    TILE = 32
+    # Skip if per-core shard height is not a multiple of tile height
+    if total_height % (num_cores * TILE) != 0:
+        pytest.skip(
+            f"Per-core shard height must be a multiple of {TILE}: "
+            f"N*C*H={total_height}, cores={num_cores}"
+        )
     
     # Create input tensor
     input_torch = torch.randn(input_shape, dtype=torch.bfloat16)
@@ -102,8 +107,9 @@ def test_tilize_with_val_padding_height_sharded(
 @pytest.mark.parametrize(
     "input_shape, output_shape",
     [
-        ([1, 1, 32, 32], [1, 1, 64, 64]),
-        ([2, 2, 64, 64], [2, 2, 128, 128]),
+        # Make both H and W tile-aligned per-core for the tested core grids
+        ([1, 1, 64, 64], [1, 1, 128, 128]),
+        ([2, 2, 128, 128], [2, 2, 256, 256]),
     ],
 )
 @pytest.mark.parametrize("pad_value", [0.0, 2.5])
@@ -130,9 +136,13 @@ def test_tilize_with_val_padding_block_sharded(
     shard_width = width // cores_per_dim
     shard_shape = (shard_height, shard_width)
     
-    # Skip test if dimensions can't be evenly divided
-    if total_height % cores_per_dim != 0 or width % cores_per_dim != 0:
-        pytest.skip(f"Dimensions cannot be evenly divided for {cores_per_dim}x{cores_per_dim} block sharding")
+    TILE = 32
+    # Skip if per-core shard dims are not multiples of tile dims
+    if (total_height % (cores_per_dim * TILE) != 0) or (width % (cores_per_dim * TILE) != 0):
+        pytest.skip(
+            f"Per-core shard must be tile {TILE}x{TILE}-sized: "
+            f"N*C*H={total_height}, W={width}, cores_per_dim={cores_per_dim}"
+        )
     
     # Create input tensor
     input_torch = torch.randn(input_shape, dtype=torch.bfloat16)
