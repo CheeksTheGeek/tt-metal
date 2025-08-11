@@ -47,8 +47,10 @@ void TilizeWithValPadding::validate(const std::vector<Tensor>& input_tensors) co
 
     if (input_tensor_a.memory_config().is_sharded()) {
         TT_FATAL(
-            input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED,
-            "Input tensor must be width sharded");
+            input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::WIDTH_SHARDED ||
+            input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED ||
+            input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::BLOCK_SHARDED,
+            "Input tensor must be width, height, or block sharded");
         TT_FATAL(
             this->output_mem_config.memory_layout() == input_tensor_a.memory_config().memory_layout(),
             "Output tensor must have the same memory layout as input tensor");
@@ -108,14 +110,26 @@ operation::ProgramWithCallbacks TilizeWithValPadding::create_program(
     const auto& input_tensor_a = input_tensors.at(0);
     auto& output_tensor = output_tensors.at(0);
     if (input_tensor_a.memory_config().is_sharded()) {
-        return detail::tilize_with_val_padding_multi_core_sharded(input_tensor_a, output_tensor, this->pad_value);
+        if (input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED ||
+            input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::BLOCK_SHARDED) {
+            return detail::tilize_with_val_padding_multi_core_height_sharded(input_tensor_a, output_tensor, this->pad_value);
+        } else {
+            // WIDTH_SHARDED - use existing implementation
+            return detail::tilize_with_val_padding_multi_core_sharded(input_tensor_a, output_tensor, this->pad_value);
+        }
     }
     if (!this->enough_space_height) {
         return detail::tilize_with_val_padding_multi_core_block_interleaved(
             input_tensor_a, output_tensor, this->pad_value);
     }
     if (!this->use_multicore) {
-        return detail::tilize_with_val_padding_single_core(input_tensor_a, output_tensor, this->pad_value);
+        if (input_tensor_a.memory_config().is_sharded() && 
+            (input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED ||
+             input_tensor_a.memory_config().memory_layout() == TensorMemoryLayout::BLOCK_SHARDED)) {
+            return detail::tilize_with_val_padding_single_core_height_sharded(input_tensor_a, output_tensor, this->pad_value);
+        } else {
+            return detail::tilize_with_val_padding_single_core(input_tensor_a, output_tensor, this->pad_value);
+        }
     }
 
     return detail::tilize_with_val_padding_multi_core_interleaved(input_tensor_a, output_tensor, this->pad_value);

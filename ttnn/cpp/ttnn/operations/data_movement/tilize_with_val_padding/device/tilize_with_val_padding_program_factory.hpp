@@ -25,4 +25,10 @@ tt::tt_metal::operation::ProgramWithCallbacks tilize_with_val_padding_multi_core
 tt::tt_metal::operation::ProgramWithCallbacks tilize_with_val_padding_multi_core_block_interleaved(
     const Tensor& a, Tensor& output, ttnn::PadValue pad_value);
 
+tt::tt_metal::operation::ProgramWithCallbacks tilize_with_val_padding_multi_core_height_sharded(
+    const Tensor& a, Tensor& output, ttnn::PadValue pad_value);
+
+tt::tt_metal::operation::ProgramWithCallbacks tilize_with_val_padding_single_core_height_sharded(
+    const Tensor& a, Tensor& output, ttnn::PadValue pad_value);
+
 }  // namespace ttnn::operations::data_movement::detail
